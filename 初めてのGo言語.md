@@ -581,7 +581,7 @@ sort.Slice(people, func (i, j int) bool {
 ```
 Goは関数を返す関数も作ることができる。高階関数は、関数が引数として関数を受け取ったり、関数を返したりすることである。つまり、Goも高階関数をサポートしている。
 
-defer A()みたいな感じで関数終了時に処理を入れることができる。deferは同一関数内で複数宣言できて、LIFO（後入れ先だし）で処理される。deferぶんに戻り値を持つ関数を書くことは一応できるが、意味なし。
+defer A()みたいな感じで関数終了時に処理を入れることができる。deferは同一関数内で複数宣言できて、LIFO（後入れ先だし）で処理される。defer文に戻り値を持つ関数を書くことは一応できるが、意味なし。
 deferに遅延実行された関数が、外側の関数の戻り値を検証、変更する方法があり、これこそが名前付き戻り値を利用する理由である。というかdeferでは普通に名前付き戻り値を参照、変更できる。
 ```
 func DoSomeInserts(ctx context.Context, db *sql.DB, value1, value2 string) (err error) {
@@ -842,7 +842,215 @@ type ReadCloser interface {
 
 interface{}の代わりにnilを利用できる。JSONから読み込まれた形式が不明なデータの記憶場所などとして利用できるが、可能であれば避けるべき。mapにanyを入れて色々なものを突っ込むこともできる。
 
-こんな
+変数.(型)で型アサーションができる。型アサーションが間違っていた場合、パニックになる。カンマokイディオムを使って回避することができる。
+というか、自分が書いたコードを他人、あるいは半年後の自分がどう使うかはわからないので、型アサーションに間違いがなくてもカンマokイディオムを利用すべき。
 ```Go
-ma["a"].(int)
+var i interface{}
+i = 10
+i2, ok := i.(int)
+if ok {
+    fmt.Println(i2)
+} else {
+    fmt.Println("ng")
+}
 ```
+
+インターフェイスが複数の型のいずれかを取る場合、型Switchというのも利用できる。
+```Go
+var i interface{}
+i = true
+
+switch i.(type) {
+case nil:
+    fmt.Println("nil")
+case string:
+    fmt.Println("string")
+case int:
+    fmt.Println("int")
+default:
+    fmt.Println("yo")
+}
+```
+
+型アサーションと型switchの仕様は控えめにするべき。とはいえ、インターフェイスに準拠しているかどうかを調べて、そのインターフェイスのメソッドを実行するというようなユースケースも考えられる。
+
+任意のユーザ定義型にメソッドを追加できるため、ユーザの定義した関数にもメソッドを生やすことができる。
+```Go
+type HandlerFunc func(http.ResponseWriter, *http.Request)
+func (f HandlerFunc) ServeHTTP(w http.ResponseWriter, r *http.Request) { 
+    f(w, r)
+}
+```
+
+# 8章エラー処理
+Goは関数からerror型を返すことによってエラーを処理する。これは慣習なので、破るべきではない。
+
+errors.New()でエラーを作成できる。また、fmt.Errorfでも良い。
+```Go
+err := errors.New("x is not 5")
+		fmt.Println(err)
+```
+もしくは
+```Go
+err := fmt.Errorf("%d is not 5", x)
+```
+
+エラーを投げるのではなく、返す理由は以下の2つ
+- 例外があるとコードのパスが一つ追加され、これはわかりにくい可能性がある
+- エラーに対して、処理をするか、無視をするかを明示できる（Goでは使われない変数がないことをコンパイラが強要するので）
+
+センチネルエラーとは、Goで時々見るエラーハンドリングのパターンの一つである（ちなみに、sentinelには見張りや衛兵といった意味があるらしい）。
+単純にerr != nilでエラー判定するのではなく、err != zpi.ErrFormat のような比較で、より具体的なエラーの種類を明示することで、特定エラーへの対応を行うことができる。
+例えば、Goの標準ライブラリのarchive/apiではパッケージレベルで以下のようなエラーが定義されている。https://cs.opensource.google/go/go/+/refs/tags/go1.22.0:src/archive/zip/reader.go;l=27
+センチネルエラーはio.EOFを例外として、全てのエラー変数の名前をErrから始める慣習がある。
+```Go
+var (
+	ErrFormat       = errors.New("zip: not a valid zip file")
+	ErrAlgorithm    = errors.New("zip: unsupported compression algorithm")
+	ErrChecksum     = errors.New("zip: checksum error")
+	ErrInsecurePath = errors.New("zip: insecure file path")
+)
+```
+以下はその活用例（初めてのGo言語より）
+```Go
+nonZipFile := bytes.NewReader(data)
+_, err := zip.NewReader(nonZipFile, int64(len(data)))
+if err == zip.ErrFormat {
+    fmt.Println("ZIP形式ではありません")
+}
+```
+
+センチネルエラーは柔軟性がないので、使う時は慎重に
+
+以下のような形で、エラータイプを定義するというアプローチもある。errorはErrorメソッドを持つインターフェイス。
+```Go
+type StatusErr struct {
+Status Status // 状態 
+Message string // メッセージ
+}
+func (se StatusErr) Error() string {
+ return se.Message
+}
+```
+
+エラーチェーンについて
+
+fmt.Errorfには特別な動詞「%w」があり、これを利用してエラーをラップすることができる（エラーチェーン）。
+取り出しにはerrors.Unwrap(err)を利用することができる。とはいえ、通常errors.Unwrapを直接呼ぶことは少なく、次に説明するerrors.Isやerrors.Asを利用するのが一般的。
+
+```Go
+func emitDeepError() error {
+	return fmt.Errorf("deep error")
+}
+
+func emitError() error {
+	err := emitDeepError()
+	return fmt.Errorf("error: %w", err)
+}
+/// main関数内でエラーを案ラップする
+    if wrappedError := errors.Unwrap(err); wrappedError != nil {
+		fmt.Println(wrappedError)
+	}
+```
+
+センチネルエラーがラップされると==を使ってチェックできない。GoではerrorsのIsとAsという2つの関数によってこれを解決する。
+
+errors.Isはエラーチェーンの中に提供されたセンチネルエラーにマッチするエラーがあればtrueを返す。
+自分が定義したエラー型についてうまくいかない場合（フィールドにスライスが含まれていて正確な比較ができないなど）はIsを独自に定義することも可能。
+基本的な使い方は以下の通り。
+```Go
+if errors.Is(err, ErrDeepError) {
+    fmt.Println("emitDeepError is found")
+}
+```
+
+errors.Asは戻されたエラーが特定の**型**にマッチするかを検証できる。つまり、エラーはセンチネルエラーではなく、独自の型である必要がある。
+
+```Go
+type ErrDeepError struct {
+	message string
+}
+
+func (e ErrDeepError) Error() string {
+	return e.message
+}
+...
+// main関数内
+if errors.As(target, &err) {
+    fmt.Println("emitDeepError is found")
+}
+```
+
+エラーチェーンの中で特定のインスタンスあるいは特定の**値**を探している時はerrors.Isを利用し、特定の**型**を探している時はerrors.Asを利用する。
+
+panicについて
+
+panicはスライスの範囲外アクセスやメモリの枯渇などで発生する。panicが起こると実行中の関数は即座に終了するが、defer文は実行される。
+panicは`panic(msg)`のようにして実行できる。また、以下のようなdeferをpanicが起こる箇所よりも前に定義しておくとpanicをキャッチし、処理を継続できる（try-catchみたいな感じだと思う）。
+```Go
+defer func() {
+    if v := recover(); v != nil {
+        fmt.Println("recovered from panic")
+    }
+}()
+```
+
+メモリやディスクスペースがなくなった時にdeferで現状をログに書き出し、os.Exit(1)を使って終了するのが最も安全である。
+0で割っていないかをチェックして必要な場合はエラーを返すというのは「イディオム的」であると言える。
+サードパーティー用のライブラリを作成している場合は、公開APIの境界を超えてパニックを伝搬させてはならない。パニックの可能性があるならrecoverを使ってpanicをエラーに変換し、
+呼び出し側に対応を決めてもらう。
+
+初心者はスタックトレースを取得するためにpanicとrecoverを使いたくなる。デフォルトではスタックトレースは表示されないからだ。
+しかし、サードパーティーのライブラリにコールスタックを自動生成してくれるものがある。
+（初めてのGo言語で紹介されているライブラリはアーカイブ化されていて今は使え無さそう。)
+
+# 9章 モジュールとパッケージ
+
+Goのライブラリは大きい方からリポジトリ、モジュール、パッケージの3つの概念で管理される。
+
+一つのディレクトリ内の全てのGoファイルは同じパッケージ節を持っている必要がある。
+
+基本的にパッケージ節はディレクトリと同じで良いが、パッケージ名はパッケージ節で決められる。これが活用できるのは以下のパターン
+- mainの場合。mainはインポートできないのでimport文に混乱は生じない
+- Goの識別子として有効ではない文字がディレクトリ名に使われている。
+- ディレクトリを使ったバージョニングをサポートするため
+
+パッケージの命名法について。同じパッケージutilにExtractNameとFormatNameを作るのは好ましくない。extractとformatの両方のディレクトリを作った方が良い。
+また、パッケージの名前をそのパッケージ内の関数や肩の名前で繰り返すのは避けるべき。extractというパッケージ内の関数にExtractNamesとつけるのはやめる。
+
+同じ名前の別のパッケージをimportする場合、以下のように前に名前をつけてrandという名前をオーバーライドすることでかぶらなくなる。
+```Go
+import (
+    crand "crypto/rand" 
+    "encoding/binary" 
+    "fmt"
+    "math/rand"
+)
+```
+
+go docコマンドを利用してドキュメントを見ることができる。コメントはしっかり書きましょう。
+
+internalパッケージを利用すると、親ディレクトリと兄弟ディレクトリのみがアクセス可能になる。
+
+Goではインポートしたパッケージが利用されないとエラーになるが、名前として「_」をつけるブランクインポートによって、これを回避できる。
+init関数はパッケージが参照された際に実行されるもので、後から明示的に呼び出すことは不可能。
+```Go
+// ブランクインポートの例
+_ "github.com/go-sql-driver/mysql"
+```
+
+循環参照は、2つのパッケージ間で相互に参照し合ったときに発生するエラーで、対処法としてはパッケージを合体する、もしくは、循環参照の原因となった項目だけを別のパッケージに移動するなど。
+
+type T2 = T1 とすることで、型のエイリアスを作ることが可能。T2はエイリアスなので、メソッドを生やしたくなったらT1に生やす必要がある。
+
+コマンドsymotion-bd-w) go listで、モジュールで利用可能なバージョンを確認できる。
+例えば、``go list -m -versions github.com/go-chi/chi/v5``で利用できるバージョンを列挙できる。また、-jsonでjson出力もできる。
+
+go getコマンドを使って依存関係にあるモジュールのバージョンを変更できる。
+
+go get -u=patch モジュール名 とすることで、マイナーアップデートできる（1.2.0->1.2.1など）
+
+モジュールのドキュメンテーションはpkg.go.devというサイトに集まっている。作成したモジュールの公開はVCSに奥野と同じ程度の手間でできる。
+リポジトリのルートにLICENSEという名前のファイルを置く必要がある。
+
+Githubなどに全てのGoのモジュールが保存されているが、実際にはそこへフェッチするのではなく、Googleのプロキシサーバーからダウンロードしている。
