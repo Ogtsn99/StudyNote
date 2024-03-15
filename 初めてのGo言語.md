@@ -1054,3 +1054,415 @@ go get -u=patch モジュール名 とすることで、マイナーアップデ
 リポジトリのルートにLICENSEという名前のファイルを置く必要がある。
 
 Githubなどに全てのGoのモジュールが保存されているが、実際にはそこへフェッチするのではなく、Googleのプロキシサーバーからダウンロードしている。
+
+# 10章 並行処理
+
+Goの並行性のモデルは**CSP**(Communicating Sequential Process)に基づいている。
+
+並行性に魅力を感じるエンジニアは多いが、並行性が高まればそれだけ処理が早くなるわけでもなく、複雑なプログラムが出来上がってしまう可能性も高い。
+
+元の処理が十分に短時間で終了するものの場合、並行処理に必要なデータの受け渡しによるオーバーヘッドが並行処理によるスピードアップを上回ってしまう可能性もある。
+
+## ゴルーチン
+
+**ゴルーチン**(goroutine)はGoの並行性モデルの中核となる概念であり、Goのランタイムによって管理される「軽い」スレッドである。
+Goのランタイムはプログラムを実行するためにいくつかのスレッドを作成し、最初に一つゴルーチンを起動する。
+ここで起動したスレッドに、ゴルーチンはランタイムによって自動的に割り当てられる。
+
+ゴルーチンにはいくつかの長所がある
+- ゴルーチンの生成はOSレベルのリソースを生成しているのではないため早い。
+- ゴルーチンの当初のスタックサイズはスレッドのスタックサイズよりも小さくなり、必要に応じて大きくなる。すなわち、メモリ効率が良い。
+- ゴルーチンのスイッチングの方がスレッドのスイッチングよりも早い。全体がプロセス内で行われるため、遅いシステムコールを避けられる。
+- 同一プロセス内の処理になるのでスケジューリングを最適化できる。
+
+呼び出しの時に関数名の前に"go"というキーワードがついていればゴルーチンとして起動される。ゴルーチンとして起動した関数から返される値は無視されるので注意。
+
+ゴルーチンでは、情報のやり取りに**チャネル**(channel)を利用する。以下のように、makeにキーワードchanとやり取りする型を指定してチャネルを作成できる
+
+```Go
+ch := make(chan int)
+```
+
+スライスやマップ同様、チャネルは参照型なので関数にチャネルを渡す時、実際にはチャネルへのポインタを渡すことになる。
+
+チャネルとやり取りするときはオペレータ"<-"を使う。チャネルからの読み込みではチャネルの左、書き込みでは右に置く。
+
+```Go
+a := <-ch
+ch <- b
+```
+
+チャネルに書き込まれた値は一度だけ読み込まれる。同じチャネルから複数のゴルーチンが読み込みを行っている場合は一つのゴルーチンからのみ読み込まれる。
+
+関数の引数では <-chanやchan<-と書くことで、書き込み、読み込みのどちらを行うかを明示できる
+```Go
+func runThingsConcurrently(chIn <-chan int, chOut chan<- string) {
+```
+
+デフォルトではチャネルはバッファリングされないため、書き込みを行うと読み込まれるまで停止する、もしくは読み込もうとすると書き込まれるまで停止する。
+
+バッファ付きチャネルもあり、これならバッファが一杯にならない限りは停止しない。
+バッファリングされるチャネルを作るには以下のように第二引数にバッファのキャパシティを指定する。
+```Go
+ch := make(chan int, 10)
+```
+
+ほとんどの場合、バッファリングされないチャネルを使うべき。
+
+for-rangeループの中でチャネルを利用することもできる。チャネルがクローズされるかbreak文あるいはreturn文に出会うことでループから抜ける。
+```Go
+for v := range ch {
+    fmt.Println(v)
+}
+```
+
+チャネルへの書き込みが終わったら、closeを使ってチャネルを閉じる
+
+```Go
+close(ch)
+```
+
+クローズしたチャネルに書き込もうとしたり、再度クローズしようとするとパニックになるが、読み込みは成功する。
+バッファに読み込んでいない値があればそれが返される。残っていない場合はゼロ値が返される。
+
+チャネルがクローズしたかどうかはカンマokイディオムでわかる。okがfalseならチャネルはクローズされている。
+
+Goにはswitch文に似たselect文があり、これによって複数のチャネルに対する読み込み、書き込みの操作が可能になる。
+selctでは、データの準備ができているcaseの中からランダムに選択肢、実行する。（つまり、書いた順番は関係がない）
+また、整合性がない順番でロックを取得することを防ぐため、デッドロックを防ぐことができる。以下はデッドロックするコード
+
+```Go
+func main() {
+	ch1 := make(chan int)
+	ch2 := make(chan int)
+
+	go func() {
+		v := 1
+		ch1 <- v
+		v2 := <-ch2
+		fmt.Println(v, v2)
+	}()
+	v := 2
+	ch2 <- v
+	v2 := <-ch1
+	fmt.Println(v, v2)
+}
+```
+
+以下はselect文によってデッドロックを回避するコード
+```Go
+	ch1 := make(chan int)
+	ch2 := make(chan int)
+
+	go func() {
+		v := 1
+		ch1 <- v
+		v2 := <-ch2
+		fmt.Println(v, v2)
+	}()
+
+	v := 2
+	var v2 int
+	select {
+	case ch2 <- v:
+	case v2 = <-ch1:
+	}
+	fmt.Println(v, v2)
+```
+
+forとselectの組み合わせは頻出パターンで、**for-selectループ**と呼ばれる。
+
+for-selectループにdefaultがある場合は、defaultの処理が無限に回り続けるのでおかしい可能性が高い。
+
+並行処理のベストプラクティス
+- APIに並行性は含めないこと。これは、関数の引数や型にチャネルを含めないということ。これをやってしまうとAPIのユーザーにチャネル管理の責任を負わせることになる。
+- forループで利用される値とインデックスは変化するものなので、
+ゴルーチンで利用する際には引数から渡す必要がある（そうしないとゴルーチン内での実行時に予期していたものとは違う値になっている可能性がある）
+- ゴルーチンとして実行される関数を起動する際には確実に終了するようにし、**ゴルーチンリーク**を防ぐ
+- doneチャネルパターンを利用してゴルーチンを終了させる
+- doneチャネルをcloseする処理を関数にして、キャンセレーション関数として戻り値とするのもあり
+- バッファ付きチャネルはゴルーチンをいくつ起動したかがわかっており、「起動するゴルーチンの数を制限したい」、「バッファに入ったものの処理に制限をかけたい」という場合に利用する。
+- バッファつきチャネルを利用して並行実行処理の上限を決めるテクニックは**バックプレッシャ**と呼ばれる。
+- チャネルにnilを代入するとそのcaseはselect文の中で二度と実行されない。
+- case <- time.After(2 * timeSecond): とすることで、タイムアウト処理を実現できる。
+これで抜けても実行中のゴルーチンの処理は続くので、終了させたい場合は12章で説明されるコンテキストキャンセレーションを使う。
+- sync.WaitGroupで、複数のゴルーチンの終了を待つことができる。
+- sync.Onceを利用して、1度しか実行しない処理を書くことができる（boolで管理するのと違いあるのか？->スレッドセーフなので、複数のゴルーチンからの同時アクセスも大丈夫）
+
+# 11章 標準ライブラリ
+io.Readerおよびio.Writerはインターフェイスであり、それぞれ、ReadとWriteメソッドを持つ。
+
+Goでは時間の単位はnsだが、以下のようにして時、分、秒を定義することが可能。
+ここでdの型はtime.Durationとなる。
+```Go
+d := 2 * time.Hour + 30 * time.Minute + 45.time.Second
+```
+また、特定の形式で書かれた文字列（1.5hや300msなど）をtime.ParseDurationでtime.Durationに変換することも可能
+Truncate（指定した時間で区切る）とRound（丸め）
+```Go
+	now := time.Now()
+	fmt.Println(now)                          // 2009-11-10 23:00:00 +0000 UTC m=+0.000000001
+	fmt.Println(now.Truncate(time.Hour * 24)) // 2009-11-10 00:00:00 +0000 UTC
+	fmt.Println(now.Round(time.Hour * 24)) // 2009-11-11 00:00:00 +0000 UTC
+```
+
+時刻は型time.Timeで表される。
+Goでの時刻のフォーマット指定はかなりユニークで、01/02 03:04:05PM ’06 -0700を基準に以下のように指定する。
+```Go
+t, err := time.Parse("2006年1月2日 PM3:04:05 -0700", "2022年07月15日 PM6:34:56 +0900")
+if err != nil {
+    return err 
+}
+fmt.Println(t.Format("January 2, 2006 at 3:04:05PM MST"))
+fmt.Println(t.Format("2006年1月2日 15時4分5秒"))
+fmt.Println(t.Format("2006.01.02 15:04:05" ))
+fmt.Println(t.Format("1/2/2006 15:04:05 MST"))
+```
+
+timeはSubを使ってtime.Time間の差を出したり（time.Duration形式で返される）、Addで加えたりすることもできる。
+
+time.AfterFuncを使って指定のtime.Duration経過後に関数を起動することができる
+また、time.Tickでx秒おきの無限ループの処理も可能
+```Go
+time.AfterFunc(5*time.Second, func() {
+    fmt.Println("5 seconds passed")
+})
+
+time.Sleep(10 * time.Second)
+```
+
+```Go
+for range time.Tick(3 * time.Millisecond) {
+	fmt.Println("Tick!!")
+}
+```
+
+json.Unmarshal([]byte, &struct)の形で[]byte形式で渡されたjsonをstructに落とし込むことができる。第二引数はポインタである必要がある。
+```Go
+f := struct {
+    Name string `json:"name"`
+    Age  int    `json:"age"`
+}{}
+err := json.Unmarshal([]byte(`{"name":"John"}`), &f)
+if err != nil {
+    fmt.Println(err)
+}
+fmt.Println("%+v", f)
+```
+
+ファイルの読み書きでbyte[]に変換してjson.Unmarshalやjson.Marshalをするのは効率があまり良くない。
+json.NewEncoder(ファイル名).Encode(struct)で、structの値をjson形式でファイルに書き込むことができ、
+json.NewDecoder(ファイル名).Decode(&struct)でファイルのjsonをstructに落とし込むことができる
+
+MarshalJsonおよびUnmarshalJSONを実装することでカスタムされたJSONエンコーダー/デコーダーを作成することができる。
+日付の読み書きなどに便利。
+
+Goにはnet/httpというHTTP/2のクライアントとサーバが含まれているが、昔の多くの他の言語ディストリビューションはこれをサードパーティの責任と考えていたらしい。
+
+http.ClientでHTTPリクエストの生成とレスポンスの受信ができる。
+DefaultClientもnet/httpパッケージに含まれているが、これはタイムアウトの設定がないので本番環境では使わないほうが良い。
+http.Clientはゴルーチンを跨いだ複数の同時リクエストも適切に処理してくれるのでインスタンスは一つで十分（賢い）
+```Go
+client := http.Client{
+    Timeout: 30 * time.Second,
+}
+```
+リクエストを送りたい時はhttp.NewRequestWithContextを利用する。
+POST, PUT, PATCHリクエストでは最後の引数にボディをio.Readerとして指定する（ボディがない場合はnil）
+
+以下はclientからjsonを受け取ってデコードして表示するコード。以下ではGetメソッドを利用してAPIを叩いているが、より細かい指定をしたい場合は
+http.NewRequestWithContextでreqインスタンスを作った後にclient.Doに入れる方法が良い。具体的にはリクエストのヘッダに何かを追加したり、GET, POST以外を投げる時に使える。
+```GO
+	client := http.Client{
+		Timeout: 30 * time.Second,
+	}
+	res, err := client.Get("https://jsonplaceholder.typicode.com/todos/1") // jsonを返すフリーサイト
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	defer res.Body.Close()
+	var data struct {
+		UserID    int    `json:"userId"`
+		ID        int    `json:"id"`
+		Title     string `json:"title"`
+		Completed bool   `json:"completed"`
+	}
+	// var data map[string]any
+	err = json.NewDecoder(res.Body).Decode(&data)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	fmt.Printf("%+v\n", data)
+```
+
+http.Serverとhttp.Handlerを利用してHTTPサーバを実現できる。
+リクエストはhttp.ServerのフィールドHandlerに代入されたhttp.Handlerの実装で処理される。
+```Go
+type Handler interface {
+    ServeHTTP(http.ResponseWriter, *http.Request)
+}
+```
+この2番目の引数*http.RequestはClientで作成したreqと同じ型である。
+
+ResponseWriterは以下のようになっている
+```Go
+type ResponseWriter interface {
+    Header() http.Header
+    Write([]byte) (int, error)
+    WriteHeader(statusCode int)
+}
+```
+以下の順序で呼び出す必要がある。
+まず、Header()を呼び出してレスポンスヘッダを設定する（省略可能）。WriteHeader()ではステータスを指定（200なら省略可能）。Write()ではレスポンスのボディを設定。
+
+一つのリクエストしか処理できないサーバは不便なので、http.ServeMuxを利用して、複数のパスとそれを処理するハンドラを作成できる。
+
+# 12章 コンテキスト
+Goにおけるコンテキストは処理のデッドライン(time.Time）、キャンセレーションシグナル、その他必要な値をゴルーチン間で受け渡すことができる。
+
+コンテキストが必要な関数は第一引数をコンテキスト型にするというのが慣習らしい。
+
+コンテキストを作るにはcontext.Backgroundで生成でき、context.Context型が返される。
+
+req.Contextでそのリクエストに関連したContextを取得できる。また、req.WithContext(ctx)で、コンテキストをラップすることができる。
+
+いくつかのゴルーチンで処理を行っている場合に、一つ失敗したら他のゴルーチンも終了させたいという時に便利なのがcontext.WithCancelである。
+このctxを渡されたゴルーチンはcancel関数を利用して終了させることができる。
+```Go
+ctx, cancel := context.WithCancel(ctx)
+```
+
+時間指定でゴルーチンを終了させることもできる。利用する関数はcontext.WithTimeout(time.Duration)とcontext.WithDeadline(time.Time)である。
+親のcontextが終了すると、子のcontextも終了する（これは明示的にキャンセルを行なった場合も同じ）。
+```Go
+	ctx := context.Background()
+	parent, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	child, cancel2 := context.WithTimeout(parent, 3*time.Second)
+	defer cancel2()
+	start := time.Now()
+	x := <-child.Done()
+	end := time.Now()
+	fmt.Println(x, end.Sub(start))
+```
+
+コンテキストには値もいれられる（context.WithValue）。ここでの値の検索は線形なので、たくさん入れると遅くなることに注意。
+コンテキストのキーにはintをベースにエクスポートしない新しい型を作成するべき。型が違えば衝突しないが、 文字列や他のパブリックな型では衝突する可能性がある。
+```Go
+type key int
+const k key = 1
+// main関数内
+	ctx := context.WithValue(context.Background(), k, "value")
+	v := ctx.Value(1)
+	fmt.Println(v) // nil
+	v = ctx.Value(k)
+	fmt.Println(v) // "value"
+```
+外部パッケージから取得するには、同一パッケージに取得用の関数を生やしておけば良い。
+```Go
+func GetValueFromContext(ctx context.Context, k key) (string, bool) {
+	v, ok := ctx.Value(k).(string)
+	return v, ok
+}
+```
+
+# 13章 テスト
+Goは標準ライブラリにテスト支援機能が入っていて簡単にテストを作成できるため、テストを作成しない言い訳はできない。
+
+全てのテストファイル名は_test.goで終わる。
+
+goのテストはどのパッケージを実行するかを指定できる。./...とすると、カレントディレクトリ以下のパッケージを全て実行でき、-vをつけると詳細な結果が得られる。
+
+失敗時のメッセージはt.Errorfを使える。また、処理を終了させるにはFatalとFatalfを使う。
+
+構造体、マップ、スライスの比較にreflrect.DeepEqualを利用しても良いが、go-cmpを使うとマッチしない部分に関する詳細な説明も返してくれる。
+```Go
+cmp.Diff(expected, result); diff != "" {
+    t.Errorf(diff)
+}
+```
+
+テーブルテストパターンを利用して、複数パターンの入力によるテストを実行することができる。
+```Go
+	data := []struct {
+		a, b, expected int
+	}{
+		{1, 2, 3},
+		{0, 0, 0},
+		{-1, 1, 0},
+		{-1, -1, -2},
+		{1, -1, 0},
+	}
+
+	for _, d := range data {
+		testTitle := fmt.Sprintf("Add(%d, %d)", d.a, d.b)
+		t.Run(testTitle, func(t *testing.T) {
+			result := add(d.a, d.b)
+			if result != d.expected {
+				t.Errorf("expected %d, got %d", d.expected, result)
+			}
+		})
+	}
+```
+
+go testに-coverフラグを追加するとコードカバレッジの情報を計算し、まとめをテスト結果の出力に表示してくれる。
+さらに-coverprofile=c.outなどを追加するとカバレッジの情報をファイルに保存できる。（以下はc.outの中身だが、よくわからない。）
+```
+mode: set
+playground/main.go:7.28,9.2 1 1
+playground/main.go:11.13,13.2 1 0
+```
+go tool cover -html=c.outとするとhtmlで表示してくれて非常にわかりやすくなる
+![スクリーンショット 2024-03-15 11.17.50（2）.png](%E3%82%B9%E3%82%AF%E3%83%AA%E3%83%BC%E3%83%B3%E3%82%B7%E3%83%A7%E3%83%83%E3%83%88%202024-03-15%2011.17.50%EF%BC%882%EF%BC%89.png)
+
+コードカバレッジは便利だが、それでもなおテストケースの漏れがある可能性は排除できないので、参考に止める程度にするべき。
+
+テストファイルの中のBenchmarkから始まる関数はベンチマーク用のテスト関数である。引数にはb *testing.Bが含まれる。
+testing.Bはtesting.Tの全ての機能を持っている。
+基本的なベンチマーク計測のコードは以下のようになる。ここで、ブラックホールはコンパイラが最適化して処理を飛ばしてしまうことの対策らしい。
+```Go
+var blackhole any
+
+func BenchmarkAdd(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		l := make([]int, 100000)
+		for i := 0; i < len(l); i++ {
+			l[i] = i
+		}
+		blackhole = l
+	}
+}
+```
+
+-bench=関数名をつけることで全てのベンチマークの計測が可能。関数名を「.」にすれば全部シーケンシャルに実行してくれる。
+b.Nはベンチマークの試行回数で、for文に入れておくと結果が妥当になるまでやってくれる。また、-benchmemを含めるとメモリ割り当ての情報も出力してくれる。
+
+t.Runと同様、b.Runで複数ケースのベンチマークを計測できる。
+
+Goのプロファイリング（コードの実行時間を詳しく調査し、ネックとなる部分を突き止めるといったこと）にはpprofなどのツールがある
+
+スタブとモックは少し異なる意味合い。スタブは返ってくる値を指定するもので、
+モックは指定された順、指定された引数で呼び出されているかをチェックするもの（つまり、モックは呼び出され方に関心がある）
+
+スタブはインターフェイスを実装して、メソッドの中身でシンプルに引数に応じた値を返せば良い。
+例えば、Add関数なら加算をするのではなく、if a == 1 && b == 1; return 2 みたいにする。
+
+複数箇所から呼び出される場合に毎回ifやswitchを追加していては読みにくく、保守しにくくなってしまう。
+そんな時は以下のような「インターフェイスのメソッドに適合する関数型をフィールドに持つ構造体」を定義する
+
+```Go
+type EntitesStub struct {
+    getUser (id int) (User, error)
+    getPets (id int) ([]Pet, error)
+}
+
+func (es EntitiesStub) GetUser(id int) {
+    return es.getUser(id)
+}
+
+func (es EntitiesStub) GetPets(id int) {
+    return es.getPets(id)
+}
+```
